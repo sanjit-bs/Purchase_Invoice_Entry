@@ -101,16 +101,36 @@ with tab1:
 
         inv_number = st.text_input("Invoice Number *", placeholder="e.g. INV/2026/001", key=f"inv_num_{key_suffix}")
         product_name = st.text_input("Product Name *", placeholder="e.g. Maplitho Paper", key=f"prod_name_{key_suffix}")
+        unit = st.selectbox("Unit *", UNIT_OPTIONS, key=f"unit_{key_suffix}")
 
     with col2:
         quantity = st.number_input("Quantity *", min_value=0.0, value=0.0, step=1.0, format="%.2f", key=f"qty_{key_suffix}")
         rate = st.number_input("Rate *", min_value=0.0, value=0.0, step=0.5, format="%.2f", key=f"rate_{key_suffix}")
-        unit = st.selectbox("Unit *", UNIT_OPTIONS, key=f"unit_{key_suffix}")
         
-        # Automatic Invoice Value calculation with manual override option
-        calc_inv_val = round(quantity * rate, 2)
-        inv_value = st.number_input("Invoice Value (₹) *", min_value=0.0, value=float(calc_inv_val), step=10.0, format="%.2f", key=f"inv_val_{key_suffix}")
-        st.caption(f"💡 Calculated Value (`Qty × Rate`): ₹ {calc_inv_val:,.2f}")
+        # 1. Automatic Taxable Value calculation (Quantity * Rate)
+        taxable_value = round(quantity * rate, 2)
+        st.number_input("Taxable Value (₹) [Qty × Rate]", value=float(taxable_value), disabled=True, key=f"tax_val_{key_suffix}")
+
+        # 2. GST Percentage Selection & Live Calculation
+        gst_pct = st.selectbox("GST Percentage (%) *", GST_PERCENTAGE_OPTIONS, index=1, key=f"gst_pct_{key_suffix}")
+        
+        half_gst_pct = gst_pct / 2.0
+        sgst_val = round(taxable_value * (half_gst_pct / 100.0), 2)
+        cgst_val = round(taxable_value * (half_gst_pct / 100.0), 2)
+        total_gst = sgst_val + cgst_val
+
+        # Display live GST metrics
+        c_m1, c_m2, c_m3 = st.columns(3)
+        c_m1.metric(f"SGST ({half_gst_pct}%)", f"₹ {sgst_val:,.2f}")
+        c_m2.metric(f"CGST ({half_gst_pct}%)", f"₹ {cgst_val:,.2f}")
+        c_m3.metric(f"Total GST ({gst_pct}%)", f"₹ {total_gst:,.2f}")
+
+        # 3. Round Off Adjustment
+        round_off = st.number_input("Round Off (+/-)", value=0.0, step=0.01, format="%.2f", key=f"round_{key_suffix}")
+        
+        # Final Invoice Value Calculation
+        calc_inv_val = round(taxable_value + total_gst + round_off, 2)
+        inv_value = st.number_input("Final Invoice Value (₹) *", min_value=0.0, value=float(calc_inv_val), step=1.0, format="%.2f", key=f"inv_val_{key_suffix}")
 
     remark = st.text_area("Remark / Notes", placeholder="Supplier details, batch numbers, or terms...", key=f"rem_{key_suffix}")
 
@@ -136,6 +156,10 @@ with tab1:
                 "quantity": quantity,
                 "rate": rate,
                 "unit": unit,
+                "taxable_value": taxable_value,
+                "gst_pct": gst_pct,
+                "total_gst": total_gst,
+                "round_off": round_off,
                 "inv_value": inv_value,
                 "remark": remark.strip()
             }
@@ -149,7 +173,7 @@ if st.session_state.upload_modal_data is not None:
 
     @st.dialog("📸 Upload Purchased Invoice Scan Copy")
     def open_scan_upload_modal():
-        st.info(f"**Invoice No:** `{data_entry['inv_number']}` | **Company:** `{data_entry['company_name']}`")
+        st.info(f"**Invoice No:** `{data_entry['inv_number']}` | **Company:** `{data_entry['company_name']}` | **Total Value:** `₹ {data_entry['inv_value']:,.2f}`")
         
         input_mode = st.radio(
             "Select Scan Source",
@@ -193,7 +217,7 @@ if st.session_state.upload_modal_data is not None:
                             entry_timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
                             # 3. Append complete entry to Google Sheet
-                            # Layout: [Invoice Date, Entry Timestamp, Company Name, Invoice No, Product Name, Quantity, Rate, Unit, Invoice Value, Scan Link, Remark]
+                            # Layout: [Invoice Date, Entry Timestamp, Company Name, Invoice No, Product Name, Quantity, Rate, Unit, Taxable Value, GST %, Total GST, Round Off, Invoice Value, Scan Link, Remark]
                             purchase_sheet.append_row([
                                 data_entry["inv_date"],
                                 entry_timestamp,
@@ -203,6 +227,10 @@ if st.session_state.upload_modal_data is not None:
                                 data_entry["quantity"],
                                 data_entry["rate"],
                                 data_entry["unit"],
+                                data_entry["taxable_value"],
+                                f"{data_entry['gst_pct']}%",
+                                data_entry["total_gst"],
+                                data_entry["round_off"],
                                 data_entry["inv_value"],
                                 drive_link,
                                 data_entry["remark"]
@@ -234,7 +262,6 @@ with tab2:
         headers = raw_data[0]
         df_log = pd.DataFrame(raw_data[1:], columns=headers)
         
-        # Render clean Dataframe with clickable hyperlinks
         st.dataframe(
             df_log,
             column_config={
