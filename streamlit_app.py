@@ -28,6 +28,7 @@ COMPANY_LIST = [
 ]
 
 UNIT_OPTIONS = ["per kg", "per pcs", "per gross", "per ream", "per box", "per pkt"]
+GST_PERCENTAGE_OPTIONS = [0.0, 5.0, 12.0, 18.0, 28.0]
 
 # ======================================================
 # Database Connector (gspread)
