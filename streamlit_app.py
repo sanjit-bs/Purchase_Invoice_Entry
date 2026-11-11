@@ -22,8 +22,14 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 COMPANY_LIST = [
     "Select Company",
-    "Shivam Enterprise",
+    "KALIKA PRESS PVT. LTD.",
     "P.S.INDUSTRIES",
+    "New Subir Paper Mart",
+    "Reflection Papers Pvt. Ltd.",
+    "RIPCO TRADERS PVT. LTD.",
+    "Super  Adhesives",
+    "Calcutta Carton Company",
+    "KRISHNA TRADERS",
     "Others"
 ]
 
