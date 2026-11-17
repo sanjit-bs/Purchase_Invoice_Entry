@@ -30,6 +30,7 @@ COMPANY_LIST = [
     "Super  Adhesives",
     "Calcutta Carton Company",
     "KRISHNA TRADERS",
+    "Sanjay Sales Corporation",
     "Others"
 ]
 
