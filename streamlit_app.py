@@ -33,7 +33,7 @@ COMPANY_LIST = [
     "Others"
 ]
 
-UNIT_OPTIONS = ["per kg", "per pcs", "per gross", "per ream", "per box", "per pkt"]
+UNIT_OPTIONS = ["per kg", "per pcs", "per gross", "per ream", "per box", "per pkt", "per roll"]
 GST_PERCENTAGE_OPTIONS = [0.0, 5.0, 12.0, 18.0, 28.0]
 
 # ======================================================
