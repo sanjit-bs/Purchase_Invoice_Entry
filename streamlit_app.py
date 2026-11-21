@@ -99,7 +99,7 @@ with tab1:
 
     col1, col2 = st.columns(2)
     with col1:
-        inv_date = st.date_input("Invoice Date *", value=date.today(), key=f"inv_date_{key_suffix}")
+        inv_date = st.date_input("Invoice Date *", value=date.today(), format="DD/MM/YYYY", key=f"inv_date_{key_suffix}")
         
         selected_company = st.selectbox("Company Name *", COMPANY_LIST, key=f"comp_{key_suffix}")
         if selected_company == "Others":
@@ -116,8 +116,15 @@ with tab1:
         rate = st.number_input("Rate *", min_value=0.0, value=0.0, step=0.5, format="%.2f", key=f"rate_{key_suffix}")
         
         # 1. Automatic Taxable Value calculation (Quantity * Rate)
+        # Dynamic key forces Streamlit to refresh the disabled box whenever taxable_value updates
         taxable_value = round(quantity * rate, 2)
-        st.number_input("Taxable Value (₹) [Qty × Rate]", value=float(taxable_value), disabled=True, key=f"tax_val_{key_suffix}")
+        st.number_input(
+            "Taxable Value (₹) [Qty × Rate]",
+            value=float(taxable_value),
+            format="%.2f",
+            disabled=True,
+            key=f"tax_val_{key_suffix}_{taxable_value}"
+        )
 
         # 2. GST Percentage Selection & Live Calculation
         gst_pct = st.selectbox("GST Percentage (%) *", GST_PERCENTAGE_OPTIONS, index=1, key=f"gst_pct_{key_suffix}")
@@ -125,7 +132,7 @@ with tab1:
         half_gst_pct = gst_pct / 2.0
         sgst_val = round(taxable_value * (half_gst_pct / 100.0), 2)
         cgst_val = round(taxable_value * (half_gst_pct / 100.0), 2)
-        total_gst = sgst_val + cgst_val
+        total_gst = round(sgst_val + cgst_val, 2)
 
         # Display live GST metrics
         c_m1, c_m2, c_m3 = st.columns(3)
@@ -136,9 +143,23 @@ with tab1:
         # 3. Round Off Adjustment
         round_off = st.number_input("Round Off (+/-)", value=0.0, step=0.01, format="%.2f", key=f"round_{key_suffix}")
         
-        # Final Invoice Value Calculation
+        # 4. Final Invoice Value Calculation (Updates live on input change, still editable)
         calc_inv_val = round(taxable_value + total_gst + round_off, 2)
-        inv_value = st.number_input("Final Invoice Value (₹) *", min_value=0.0, value=float(calc_inv_val), step=1.0, format="%.2f", key=f"inv_val_{key_suffix}")
+        inv_val_key = f"inv_val_{key_suffix}"
+        last_calc_key = f"last_calc_{key_suffix}"
+
+        # Sync session_state whenever calculated value changes so the box reflects live math
+        if st.session_state.get(last_calc_key) != calc_inv_val:
+            st.session_state[inv_val_key] = float(calc_inv_val)
+            st.session_state[last_calc_key] = calc_inv_val
+
+        inv_value = st.number_input(
+            "Final Invoice Value (₹) *",
+            min_value=0.0,
+            step=1.0,
+            format="%.2f",
+            key=inv_val_key
+        )
 
     remark = st.text_area("Remark / Notes", placeholder="Supplier details, batch numbers, or terms...", key=f"rem_{key_suffix}")
 
@@ -155,7 +176,6 @@ with tab1:
         elif rate <= 0:
             st.warning("Rate must be greater than zero.")
         else:
-            # Store validated form data in session state and trigger upload modal
             st.session_state.upload_modal_data = {
                 "inv_date": inv_date.strftime("%d/%m/%Y"),
                 "company_name": company_name.strip(),
@@ -205,7 +225,6 @@ if st.session_state.upload_modal_data is not None:
                     st.warning("Please upload or capture a scan copy before submitting.")
                 else:
                     with st.spinner("Uploading Scan to Drive & Saving History Log..."):
-                        # Prepare File Payload
                         bytes_content = file_data.getvalue()
                         clean_inv = data_entry["inv_number"].replace("/", "_")
                         ext = file_data.name.split(".")[-1] if hasattr(file_data, "name") and "." in file_data.name else "png"
@@ -225,7 +244,6 @@ if st.session_state.upload_modal_data is not None:
                             entry_timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
                             # 3. Append complete entry to Google Sheet
-                            # Layout: [Invoice Date, Entry Timestamp, Company Name, Invoice No, Product Name, Quantity, Rate, Unit, Taxable Value, GST %, Total GST, Round Off, Invoice Value, Scan Link, Remark]
                             purchase_sheet.append_row([
                                 data_entry["inv_date"],
                                 entry_timestamp,
@@ -271,14 +289,15 @@ with tab2:
         df_log = pd.DataFrame(raw_data[1:], columns=headers)
         
         st.dataframe(
-            df_log,
+            df_log.iloc[::-1],
             column_config={
                 "Scan Copy Link": st.column_config.LinkColumn(
                     "Scan Copy Link",
                     display_text="📄 View Document"
                 )
             },
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
     else:
         st.info("No purchase entries recorded yet.")
