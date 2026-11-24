@@ -26,7 +26,7 @@ SPREADSHEET_ID = "1PCJ3BWAj6Wz1N-55XpuWltvfvYd7KD1q194D3N7MzIg"
 WORKSHEET_NAME = "Purchase_Invoice_Log"
 
 # Paste the top-level Folder ID from your father's Google Drive (shared with your Service Account email)
-SHARED_DRIVE_FOLDER_ID = "PASTE_YOUR_SHARED_FOLDER_ID_HERE"
+SHARED_DRIVE_FOLDER_ID = "https://drive.google.com/drive/folders/15JHQ9jS0EmlmqKnY943eVdUDwD26b1X5"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
