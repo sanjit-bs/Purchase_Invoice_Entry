@@ -1,11 +1,13 @@
 import base64
 from datetime import datetime, date
-import json
+import io
+import re
+import fitz  # PyMuPDF
 import gspread
 from google.oauth2.service_account import Credentials
-from google import genai
-from google.genai import types
 import pandas as pd
+from PIL import Image, ImageOps
+import pytesseract
 import requests
 import streamlit as st
 
@@ -61,72 +63,179 @@ def load_history_df():
     return pd.DataFrame()
 
 # ======================================================
-# AI Invoice OCR Extractor (Gemini Vision)
+# Free Local OCR Extractor (Tesseract + PyMuPDF)
 # ======================================================
-def extract_invoice_data_from_scan(file_bytes, mime_type):
-    """
-    Reads an invoice image/PDF using Gemini Vision and returns structured fields.
-    Returns (dict, None) on success, or (None, error_message) on failure.
-    """
-    api_key = st.secrets.get("GEMINI_API_KEY", "")
-    if not api_key:
-        return None, "GEMINI_API_KEY not found in secrets."
+def preprocess_and_ocr_image(pil_img):
+    """Converts image to high-contrast grayscale and extracts text via Tesseract."""
+    gray = ImageOps.grayscale(pil_img)
+    gray = ImageOps.autocontrast(gray)
+    return pytesseract.image_to_string(gray, config="--oem 3 --psm 6")
 
-    prompt = """
-    Extract the following details from this Indian purchase tax invoice.
-    Return ONLY a valid JSON object with these exact keys:
-    - "invoice_date": string in "DD/MM/YYYY" format (or empty string if unreadable)
-    - "company_name": seller/supplier company name as string (or empty string)
-    - "invoice_number": invoice number as string (or empty string)
-    - "product_name": primary item/product description as string (or empty string)
-    - "hsn": HSN / SAC code as string (e.g. "4802", or empty string if not visible)
-    - "unit": one of ["per kg", "per pcs", "per gross", "per ream", "per box", "per pkt", "per roll", "Others"] based on unit (default "per kg")
-    - "custom_unit": if unit is "Others", specify the unit string (otherwise empty string)
-    - "quantity": numeric float (0.0 if unreadable)
-    - "rate": numeric float unit price before tax (0.0 if unreadable)
-    - "gst_percentage": total GST rate as float (e.g., 5.0, 12.0, 18.0, 28.0, or 0.0)
-    - "round_off": numeric float round off adjustment (0.0 if none)
-    """
 
+def extract_text_from_scan(file_bytes, mime_type):
+    """Extracts text from PDF (digital or scanned) or Image using free local libraries."""
+    if "pdf" in mime_type.lower():
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        full_text = ""
+        for page in doc:
+            page_text = page.get_text("text").strip()
+            if len(page_text) > 30:
+                full_text += page_text + "\n"
+            else:
+                # Scanned PDF page: render at 250 DPI and run Tesseract OCR
+                pix = page.get_pixmap(dpi=250)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                full_text += preprocess_and_ocr_image(img) + "\n"
+        return full_text.strip()
+    else:
+        img = Image.open(io.BytesIO(file_bytes))
+        return preprocess_and_ocr_image(img).strip()
+
+
+def parse_indian_invoice_text(raw_text):
+    """Parses extracted OCR text into structured invoice fields."""
+    if not raw_text or len(raw_text.strip()) < 10:
+        return None, "Could not detect readable text on the scan."
+
+    extracted = {
+        "invoice_date": "",
+        "company_name": "",
+        "invoice_number": "",
+        "product_name": "",
+        "hsn": "",
+        "unit": "per kg",
+        "quantity": 0.0,
+        "rate": 0.0,
+        "gst_percentage": 5.0,
+        "round_off": 0.0,
+    }
+
+    text_upper = raw_text.upper()
+
+    # 1. Match Company Name from COMPANY_LIST
+    for comp in COMPANY_LIST[1:-1]:
+        clean_tokens = [t for t in re.split(r"[^A-Z0-9]+", comp.upper()) if len(t) > 2 and t not in ["PVT", "LTD", "COMPANY", "CORPORATION"]]
+        if clean_tokens and all(tok in text_upper for tok in clean_tokens[:2]):
+            extracted["company_name"] = comp
+            break
+
+    # 2. Extract Invoice Date (DD/MM/YYYY or DD-MM-YYYY)
+    date_match = re.search(
+        r"(?:DATE|DATED|INV\.?\s*DATE)[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if not date_match:
+        date_match = re.search(r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]20\d{2})\b", raw_text)
+    if date_match:
+        raw_dt = date_match.group(1).replace("-", "/").replace(".", "/")
+        parts = raw_dt.split("/")
+        if len(parts) == 3:
+            if len(parts[2]) == 2:
+                parts[2] = "20" + parts[2]
+            extracted["invoice_date"] = f"{parts[0].zfill(2)}/{parts[1].zfill(2)}/{parts[2]}"
+
+    # 3. Extract Invoice Number
+    inv_match = re.search(
+        r"(?:INVOICE\s*NO|INV\.?\s*NO|BILL\s*NO|CHALLAN\s*NO)[\s.:\-#]*([A-Z0-9\/\-]{2,25})",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if inv_match:
+        candidate = inv_match.group(1).strip()
+        if candidate.upper() not in ["DATE", "DATED", "TO", "GSTIN"]:
+            extracted["invoice_number"] = candidate
+
+    # 4. Extract HSN Code (4 to 8 digits near HSN label)
+    hsn_match = re.search(r"(?:HSN(?:\/SAC)?|SAC)[\s.:\-]*(\d{4,8})\b", raw_text, re.IGNORECASE)
+    if hsn_match:
+        extracted["hsn"] = hsn_match.group(1)
+
+    # 5. Extract GST Percentage (checks CGST/SGST split or IGST/GST total)
+    split_gst = re.search(r"(?:CGST|SGST)[\s@:\-]*(\d{1,2}(?:\.\d+)?)\s*%", raw_text, re.IGNORECASE)
+    full_gst = re.search(r"(?:IGST|GST)[\s@:\-]*(\d{1,2}(?:\.\d+)?)\s*%", raw_text, re.IGNORECASE)
+    if split_gst:
+        doubled = round(float(split_gst.group(1)) * 2, 1)
+        if doubled in GST_PERCENTAGE_OPTIONS:
+            extracted["gst_percentage"] = doubled
+    elif full_gst:
+        val = float(full_gst.group(1))
+        if val in GST_PERCENTAGE_OPTIONS:
+            extracted["gst_percentage"] = val
+
+    # 6. Detect Unit keywords
+    unit_map = {
+        "per kg": r"\b(?:KGS?|KILOGRAMS?)\b",
+        "per pcs": r"\b(?:PCS|PIECES?|NOS)\b",
+        "per gross": r"\b(?:GROSS|GRUS)\b",
+        "per ream": r"\b(?:REAMS?)\b",
+        "per box": r"\b(?:BOX(?:ES)?)\b",
+        "per pkt": r"\b(?:PKTS?|PACKETS?)\b",
+        "per roll": r"\b(?:ROLLS?)\b",
+    }
+    for u_label, pattern in unit_map.items():
+        if re.search(pattern, text_upper):
+            extracted["unit"] = u_label
+            break
+
+    # 7. Extract Quantity & Rate (looks for line items with Qty + Unit + Rate pattern)
+    qty_rate_match = re.search(
+        r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:KGS?|PCS|NOS|REAMS?|GROSS|BOX|PKT|ROLL)?\s*[@xX×]?\s*(\d+(?:,\d{3})*(?:\.\d{1,2}))",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if qty_rate_match:
+        try:
+            q_val = float(qty_rate_match.group(1).replace(",", ""))
+            r_val = float(qty_rate_match.group(2).replace(",", ""))
+            if 0 < q_val < 1000000 and 0 < r_val < 1000000:
+                extracted["quantity"] = q_val
+                extracted["rate"] = r_val
+        except ValueError:
+            pass
+
+    # 8. Extract Round Off if present
+    ro_match = re.search(r"ROUND\s*OFF[\s:\-]*([+-]?\s*\d+(?:\.\d{1,2})?)", raw_text, re.IGNORECASE)
+    if ro_match:
+        try:
+            extracted["round_off"] = float(ro_match.group(1).replace(" ", ""))
+        except ValueError:
+            pass
+
+    found_any = any([
+        extracted["company_name"],
+        extracted["invoice_number"],
+        extracted["hsn"],
+        extracted["quantity"] > 0,
+    ])
+    if not found_any:
+        return None, "Could not match invoice fields from scan."
+
+    return extracted, None
+
+
+def run_local_invoice_ocr(file_bytes, mime_type):
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[
-                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            )
-        )
-        extracted = json.loads(response.text)
-        if not extracted.get("invoice_number") and not extracted.get("company_name") and float(extracted.get("quantity", 0)) <= 0:
-            return None, "Scan is unclear or could not detect invoice fields."
-        return extracted, None
+        raw_text = extract_text_from_scan(file_bytes, mime_type)
+        parsed, err = parse_indian_invoice_text(raw_text)
+        return parsed, raw_text, err
+    except pytesseract.TesseractNotFoundError:
+        return None, "", "Tesseract OCR engine not installed (add 'tesseract-ocr' to packages.txt and reboot)."
     except Exception as e:
-        return None, f"Auto-read failed ({e})."
+        return None, "", f"OCR error: {e}"
 
 
 def match_company_dropdown(extracted_name):
-    """Matches extracted supplier name against COMPANY_LIST or falls back to 'Others'."""
     if not extracted_name:
         return "Select Company", ""
-    clean_ext = extracted_name.strip().lower()
-    for comp in COMPANY_LIST[1:-1]:
-        if comp.lower() in clean_ext or clean_ext in comp.lower():
-            return comp, comp
+    if extracted_name in COMPANY_LIST:
+        return extracted_name, extracted_name
     return "Others", extracted_name.strip()
 
 # ======================================================
 # HSN Verification Helper
 # ======================================================
 def verify_company_hsn(df_history, company_name, product_name, entered_hsn):
-    """
-    Checks if the company has previous entries in Purchase_Invoice_Log and compares HSN codes.
-    Returns (is_mismatch: bool, warning_message: str)
-    """
     if df_history.empty or "Company Name" not in df_history.columns or "HSN" not in df_history.columns:
         return False, ""
 
@@ -142,7 +251,6 @@ def verify_company_hsn(df_history, company_name, product_name, entered_hsn):
     if valid_hsn_rows.empty:
         return False, ""
 
-    # 1. Same Product Name, Different HSN
     if "Product Name" in valid_hsn_rows.columns:
         same_prod_rows = valid_hsn_rows[valid_hsn_rows["Product Name"].astype(str).str.strip().str.lower() == prod_clean]
         if not same_prod_rows.empty:
@@ -154,7 +262,6 @@ def verify_company_hsn(df_history, company_name, product_name, entered_hsn):
                     f"but you entered **`{entered_hsn}`**."
                 )
 
-    # 2. Different HSN from all previously recorded HSNs for this company
     prev_company_hsns = sorted(valid_hsn_rows["HSN"].astype(str).str.strip().unique().tolist())
     if hsn_clean not in [h.lower() for h in prev_company_hsns]:
         prev_prods = []
@@ -195,6 +302,7 @@ def upload_scan_to_drive_via_appscript(file_bytes, file_name, mime_type, company
         st.error(f"Failed to connect to Apps Script: {e}")
     return None
 
+
 def execute_final_save(entry_data, scan_obj):
     with st.spinner("Uploading Scan to Google Drive & Saving Entry..."):
         clean_inv = entry_data["inv_number"].replace("/", "_")
@@ -233,6 +341,7 @@ def execute_final_save(entry_data, scan_obj):
             st.cache_data.clear()
             st.session_state.scanned_file_payload = None
             st.session_state.last_scanned_file_id = None
+            st.session_state.raw_ocr_text = ""
             st.session_state.hsn_hold_state = None
             st.session_state.form_key += 1
             st.rerun()
@@ -248,6 +357,8 @@ if "scanned_file_payload" not in st.session_state:
     st.session_state.scanned_file_payload = None
 if "hsn_hold_state" not in st.session_state:
     st.session_state.hsn_hold_state = None
+if "raw_ocr_text" not in st.session_state:
+    st.session_state.raw_ocr_text = ""
 
 key_suffix = st.session_state.form_key
 
@@ -257,10 +368,10 @@ key_suffix = st.session_state.form_key
 tab1, tab2 = st.tabs(["➕ New Purchase Entry", "📋 Purchase History Log"])
 
 # ------------------------------------------------------
-# TAB 1: AI SCAN AUTO-FILL + HSN VERIFICATION FORM
+# TAB 1: FREE LOCAL OCR AUTO-FILL + HSN VERIFICATION
 # ------------------------------------------------------
 with tab1:
-    st.subheader("1️⃣ Upload or Capture Invoice Scan (AI Auto-Fill)")
+    st.subheader("1️⃣ Upload or Capture Invoice Scan (Free Local OCR)")
 
     with st.container(border=True):
         scan_source = st.radio(
@@ -274,7 +385,7 @@ with tab1:
             uploaded_scan = st.camera_input("Capture Invoice Image", key=f"cam_{key_suffix}")
         else:
             uploaded_scan = st.file_uploader(
-                "Upload Invoice Scan (PNG, JPG, PDF) — Computer will auto-fill fields below",
+                "Upload Invoice Scan (PNG, JPG, PDF) — Computer will read text & fill fields below",
                 type=["png", "jpg", "jpeg", "pdf"],
                 key=f"upl_{key_suffix}"
             )
@@ -291,9 +402,10 @@ with tab1:
             }
 
             if st.session_state.last_scanned_file_id != file_id:
-                with st.spinner("🤖 Reading invoice scan and auto-filling form..."):
-                    extracted, err_msg = extract_invoice_data_from_scan(file_bytes, mime_type)
+                with st.spinner("🔍 Scanning document locally with Tesseract OCR..."):
+                    extracted, raw_text, err_msg = run_local_invoice_ocr(file_bytes, mime_type)
                     st.session_state.last_scanned_file_id = file_id
+                    st.session_state.raw_ocr_text = raw_text
 
                     if extracted:
                         # 1. Date
@@ -310,28 +422,34 @@ with tab1:
                             st.session_state[f"manual_comp_{key_suffix}"] = manual_comp
 
                         # 3. Text, HSN & Unit
-                        st.session_state[f"inv_num_{key_suffix}"] = str(extracted.get("invoice_number", ""))
-                        st.session_state[f"prod_name_{key_suffix}"] = str(extracted.get("product_name", ""))
-                        st.session_state[f"hsn_{key_suffix}"] = str(extracted.get("hsn", ""))
+                        if extracted.get("invoice_number"):
+                            st.session_state[f"inv_num_{key_suffix}"] = str(extracted["invoice_number"])
+                        if extracted.get("hsn"):
+                            st.session_state[f"hsn_{key_suffix}"] = str(extracted["hsn"])
 
                         ext_unit = str(extracted.get("unit", "per kg"))
                         if ext_unit in UNIT_OPTIONS:
                             st.session_state[f"unit_{key_suffix}"] = ext_unit
-                            if ext_unit == "Others":
-                                st.session_state[f"manual_unit_{key_suffix}"] = str(extracted.get("custom_unit", ""))
 
                         # 4. Numbers & GST
-                        st.session_state[f"qty_{key_suffix}"] = float(extracted.get("quantity", 0.0) or 0.0)
-                        st.session_state[f"rate_{key_suffix}"] = float(extracted.get("rate", 0.0) or 0.0)
-                        st.session_state[f"round_{key_suffix}"] = float(extracted.get("round_off", 0.0) or 0.0)
+                        if extracted.get("quantity", 0.0) > 0:
+                            st.session_state[f"qty_{key_suffix}"] = float(extracted["quantity"])
+                        if extracted.get("rate", 0.0) > 0:
+                            st.session_state[f"rate_{key_suffix}"] = float(extracted["rate"])
+                        if extracted.get("round_off", 0.0) != 0:
+                            st.session_state[f"round_{key_suffix}"] = float(extracted["round_off"])
 
-                        ext_gst = float(extracted.get("gst_percentage", 5.0) or 5.0)
+                        ext_gst = float(extracted.get("gst_percentage", 5.0))
                         if ext_gst in GST_PERCENTAGE_OPTIONS:
                             st.session_state[f"gst_pct_{key_suffix}"] = ext_gst
 
-                        st.success("✅ Scan read successfully! Please verify the auto-filled values below.")
+                        st.success("✅ Scan read locally! Please review and complete any remaining fields below.")
                     else:
-                        st.warning(f"⚠️ Could not read scan automatically ({err_msg}) **Please enter the details manually below.**")
+                        st.warning(f"⚠️ Could not auto-fill from scan ({err_msg}) **Please enter the details manually below.**")
+
+        if st.session_state.raw_ocr_text:
+            with st.expander("📄 View Raw Scanned Text (For Quick Copy/Reference)"):
+                st.text(st.session_state.raw_ocr_text)
 
     st.subheader("2️⃣ Verify or Enter Purchased Invoice Details")
 
@@ -440,7 +558,6 @@ with tab1:
                 "remark": remark.strip()
             }
 
-            # Verify HSN against historical entries of the same company
             df_hist = load_history_df()
             is_mismatch, warn_msg = verify_company_hsn(
                 df_hist,
