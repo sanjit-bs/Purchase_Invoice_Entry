@@ -1,6 +1,8 @@
 streamlit
 pandas
+requests
 gspread
 google-auth
-requests
-google-genai
+Pillow
+pytesseract
+pymupdf
