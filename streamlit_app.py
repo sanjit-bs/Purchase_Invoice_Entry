@@ -20,13 +20,13 @@ st.set_page_config(page_title="Purchased Invoice Entry", page_icon="🧾", layou
 
 st.title("🧾 Purchased Invoice Entry System")
 
-# Google Apps Script Web App Endpoint, Sheet ID & Shared Drive Folder ID
+# Google Apps Script Web App Endpoint, Sheet ID & Root Shared Drive Folder ID
 WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyOhnkbEa7JHQk49LAH1xg4PXMzeMVwPDfesMbOxeOvsDjcOjL7dEXYBGRymn-Sx6MKkQ/exec"
 SPREADSHEET_ID = "1PCJ3BWAj6Wz1N-55XpuWltvfvYd7KD1q194D3N7MzIg"
 WORKSHEET_NAME = "Purchase_Invoice_Log"
 
-# Paste the top-level Folder ID from your father's Google Drive (shared with your Service Account email)
-SHARED_DRIVE_FOLDER_ID = "https://drive.google.com/drive/folders/15JHQ9jS0EmlmqKnY943eVdUDwD26b1X5"
+# Paste the Root Folder ID from your father's Google Drive (shared with your Service Account email)
+SHARED_DRIVE_FOLDER_ID = "PASTE_YOUR_SHARED_FOLDER_ID_HERE"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -83,66 +83,48 @@ def load_history_df():
         return pd.DataFrame(raw_data[1:], columns=raw_data[0])
     return pd.DataFrame()
 
-@st.cache_data(ttl=60)
-def list_shared_drive_files(root_folder_id):
-    """Recursively lists all PDF and Image files across the main folder and all nested subfolders."""
-    if not root_folder_id or root_folder_id == "PASTE_YOUR_SHARED_FOLDER_ID_HERE":
-        return []
-
-    all_invoice_files = []
-    # Queue of tuples: (folder_id, folder_path_prefix)
-    folders_to_visit = [(root_folder_id, "")]
-
+@st.cache_data(ttl=30)
+def list_drive_folder_contents(folder_id):
+    """Lists both subfolders and PDF/Image files inside a given Google Drive folder."""
+    if not folder_id or folder_id == "PASTE_YOUR_SHARED_FOLDER_ID_HERE":
+        return [], []
     try:
-        while folders_to_visit:
-            current_id, current_path = folders_to_visit.pop(0)
-            page_token = None
+        # 1. Fetch Subfolders
+        folder_query = (
+            f"'{folder_id}' in parents and trashed = false and "
+            "mimeType = 'application/vnd.google-apps.folder'"
+        )
+        folder_res = drive_service.files().list(
+            q=folder_query,
+            fields="files(id, name)",
+            orderBy="name asc",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        subfolders = folder_res.get("files", [])
 
-            while True:
-                query = (
-                    f"'{current_id}' in parents and trashed = false and "
-                    "(mimeType='application/vnd.google-apps.folder' or "
-                    "mimeType='application/pdf' or mimeType contains 'image/')"
-                )
-                response = drive_service.files().list(
-                    q=query,
-                    fields="nextPageToken, files(id, name, mimeType, webViewLink, createdTime)",
-                    pageSize=1000,
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                    pageToken=page_token,
-                ).execute()
+        # 2. Fetch PDF & Image Files
+        file_query = (
+            f"'{folder_id}' in parents and trashed = false and "
+            "(mimeType='application/pdf' or mimeType contains 'image/')"
+        )
+        file_res = drive_service.files().list(
+            q=file_query,
+            fields="files(id, name, mimeType, webViewLink, createdTime)",
+            orderBy="createdTime desc",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = file_res.get("files", [])
 
-                for item in response.get("files", []):
-                    if item["mimeType"] == "application/vnd.google-apps.folder":
-                        sub_path = f"{current_path}/{item['name']}" if current_path else item["name"]
-                        folders_to_visit.append((item["id"], sub_path))
-                    else:
-                        folder_label = current_path if current_path else "Main Folder"
-                        display_label = f"[{folder_label}] {item['name']}"
-                        all_invoice_files.append({
-                            "id": item["id"],
-                            "name": item["name"],
-                            "folder": folder_label,
-                            "display_name": display_label,
-                            "mimeType": item["mimeType"],
-                            "createdTime": item.get("createdTime", "")
-                        })
-
-                page_token = response.get("nextPageToken")
-                if not page_token:
-                    break
-
-        # Sort newest files first
-        all_invoice_files.sort(key=lambda x: x["createdTime"], reverse=True)
-        return all_invoice_files
-
+        return subfolders, files
     except Exception as e:
-        st.error(f"Could not scan shared Google Drive folders: {e}")
-        return []
+        st.error(f"Could not read Google Drive folder: {e}")
+        return [], []
 
 def download_drive_file_bytes(file_id):
-    """Downloads file bytes from Google Drive for OCR scanning & archiving."""
     request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
@@ -195,17 +177,12 @@ def parse_indian_invoice_text(raw_text):
 
     text_upper = raw_text.upper()
 
-    # 1. Match Company Name from COMPANY_LIST
     for comp in COMPANY_LIST[1:-1]:
-        clean_tokens = [
-            t for t in re.split(r"[^A-Z0-9]+", comp.upper())
-            if len(t) > 2 and t not in ["PVT", "LTD", "COMPANY", "CORPORATION"]
-        ]
+        clean_tokens = [t for t in re.split(r"[^A-Z0-9]+", comp.upper()) if len(t) > 2 and t not in ["PVT", "LTD", "COMPANY", "CORPORATION"]]
         if clean_tokens and all(tok in text_upper for tok in clean_tokens[:2]):
             extracted["company_name"] = comp
             break
 
-    # 2. Extract Invoice Date (DD/MM/YYYY or DD-MM-YYYY)
     date_match = re.search(
         r"(?:DATE|DATED|INV\.?\s*DATE)[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
         raw_text,
@@ -221,7 +198,6 @@ def parse_indian_invoice_text(raw_text):
                 parts[2] = "20" + parts[2]
             extracted["invoice_date"] = f"{parts[0].zfill(2)}/{parts[1].zfill(2)}/{parts[2]}"
 
-    # 3. Extract Invoice Number
     inv_match = re.search(
         r"(?:INVOICE\s*NO|INV\.?\s*NO|BILL\s*NO|CHALLAN\s*NO)[\s.:\-#]*([A-Z0-9\/\-]{2,25})",
         raw_text,
@@ -232,12 +208,10 @@ def parse_indian_invoice_text(raw_text):
         if candidate.upper() not in ["DATE", "DATED", "TO", "GSTIN"]:
             extracted["invoice_number"] = candidate
 
-    # 4. Extract HSN Code (4 to 8 digits near HSN label)
     hsn_match = re.search(r"(?:HSN(?:\/SAC)?|SAC)[\s.:\-]*(\d{4,8})\b", raw_text, re.IGNORECASE)
     if hsn_match:
         extracted["hsn"] = hsn_match.group(1)
 
-    # 5. Extract GST Percentage (checks CGST/SGST split or IGST/GST total)
     split_gst = re.search(r"(?:CGST|SGST)[\s@:\-]*(\d{1,2}(?:\.\d+)?)\s*%", raw_text, re.IGNORECASE)
     full_gst = re.search(r"(?:IGST|GST)[\s@:\-]*(\d{1,2}(?:\.\d+)?)\s*%", raw_text, re.IGNORECASE)
     if split_gst:
@@ -249,7 +223,6 @@ def parse_indian_invoice_text(raw_text):
         if val in GST_PERCENTAGE_OPTIONS:
             extracted["gst_percentage"] = val
 
-    # 6. Detect Unit keywords
     unit_map = {
         "per kg": r"\b(?:KGS?|KILOGRAMS?)\b",
         "per pcs": r"\b(?:PCS|PIECES?|NOS)\b",
@@ -264,7 +237,6 @@ def parse_indian_invoice_text(raw_text):
             extracted["unit"] = u_label
             break
 
-    # 7. Extract Quantity & Rate
     qty_rate_match = re.search(
         r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:KGS?|PCS|NOS|REAMS?|GROSS|BOX|PKT|ROLL)?\s*[@xX×]?\s*(\d+(?:,\d{3})*(?:\.\d{1,2}))",
         raw_text,
@@ -280,7 +252,6 @@ def parse_indian_invoice_text(raw_text):
         except ValueError:
             pass
 
-    # 8. Extract Round Off if present
     ro_match = re.search(r"ROUND\s*OFF[\s:\-]*([+-]?\s*\d+(?:\.\d{1,2})?)", raw_text, re.IGNORECASE)
     if ro_match:
         try:
@@ -335,7 +306,6 @@ def verify_company_hsn(df_history, company_name, product_name, entered_hsn):
     if valid_hsn_rows.empty:
         return False, ""
 
-    # 1. Same Product Name, Different HSN
     if "Product Name" in valid_hsn_rows.columns:
         same_prod_rows = valid_hsn_rows[valid_hsn_rows["Product Name"].astype(str).str.strip().str.lower() == prod_clean]
         if not same_prod_rows.empty:
@@ -347,7 +317,6 @@ def verify_company_hsn(df_history, company_name, product_name, entered_hsn):
                     f"but you entered **`{entered_hsn}`**."
                 )
 
-    # 2. Different HSN from all previously recorded HSNs for this company
     prev_company_hsns = sorted(valid_hsn_rows["HSN"].astype(str).str.strip().unique().tolist())
     if hsn_clean not in [h.lower() for h in prev_company_hsns]:
         prev_prods = []
@@ -433,7 +402,7 @@ def execute_final_save(entry_data, scan_obj):
             st.rerun()
 
 # ======================================================
-# Session State Setup
+# Session State Setup (Including Folder Navigation Stack)
 # ======================================================
 if "form_key" not in st.session_state:
     st.session_state.form_key = 0
@@ -445,6 +414,8 @@ if "hsn_hold_state" not in st.session_state:
     st.session_state.hsn_hold_state = None
 if "raw_ocr_text" not in st.session_state:
     st.session_state.raw_ocr_text = ""
+if "drive_folder_stack" not in st.session_state:
+    st.session_state.drive_folder_stack = [{"id": SHARED_DRIVE_FOLDER_ID, "name": "Main Shared Folder"}]
 
 key_suffix = st.session_state.form_key
 
@@ -454,7 +425,7 @@ key_suffix = st.session_state.form_key
 tab1, tab2 = st.tabs(["➕ New Purchase Entry", "📋 Purchase History Log"])
 
 # ------------------------------------------------------
-# TAB 1: SCAN / CAPTURE / SHARED GDRIVE + ENTRY FORM
+# TAB 1: SCAN / CAPTURE / SUBFOLDER GDRIVE + ENTRY FORM
 # ------------------------------------------------------
 with tab1:
     st.subheader("1️⃣ Attach Invoice Scan (Device Upload, Camera, or Shared Drive)")
@@ -493,44 +464,62 @@ with tab1:
                 file_id = f"upl_{file_name_src}_{len(file_bytes)}"
 
         else:
-            col_gd1, col_gd2, col_gd3 = st.columns([1.8, 3.2, 1])
-            with col_gd3:
-                st.write("")
-                st.write("")
-                if st.button("🔄 Refresh", use_container_width=True):
-                    list_shared_drive_files.clear()
-                    st.rerun()
-
-            drive_files = list_shared_drive_files(SHARED_DRIVE_FOLDER_ID)
             if SHARED_DRIVE_FOLDER_ID == "PASTE_YOUR_SHARED_FOLDER_ID_HERE":
-                st.info("Set `SHARED_DRIVE_FOLDER_ID` in `app.py` and share the main folder from your father's Google Drive with your Service Account email.")
-            elif not drive_files:
-                st.warning("No PDF or Image files found in the main folder or its subfolders.")
+                st.info("Set `SHARED_DRIVE_FOLDER_ID` in `app.py` and share that folder from your father's Google Drive with your Service Account email.")
             else:
-                unique_folders = ["All Subfolders"] + sorted(list(set(f["folder"] for f in drive_files)))
-                with col_gd1:
-                    selected_sub = st.selectbox("Filter Subfolder:", unique_folders, key=f"gd_sub_{key_suffix}")
+                current_folder = st.session_state.drive_folder_stack[-1]
+                breadcrumb = " / ".join([f["name"] for f in st.session_state.drive_folder_stack])
 
-                filtered_files = (
-                    drive_files if selected_sub == "All Subfolders"
-                    else [f for f in drive_files if f["folder"] == selected_sub]
-                )
+                nav_c1, nav_c2, nav_c3 = st.columns([3.5, 1, 1])
+                with nav_c1:
+                    st.markdown(f"**📂 Current Folder:** `{breadcrumb}`")
+                with nav_c2:
+                    if len(st.session_state.drive_folder_stack) > 1:
+                        if st.button("⬅️ Back One Folder", use_container_width=True):
+                            st.session_state.drive_folder_stack.pop()
+                            st.rerun()
+                with nav_c3:
+                    if st.button("🔄 Refresh", use_container_width=True):
+                        list_drive_folder_contents.clear()
+                        st.rerun()
 
-                with col_gd2:
-                    file_options = ["Select a file from Google Drive..."] + [f["display_name"] for f in filtered_files]
-                    chosen_display = st.selectbox("Choose Invoice File:", file_options, key=f"gd_sel_{key_suffix}")
+                subfolders, drive_files = list_drive_folder_contents(current_folder["id"])
 
-                if chosen_display != "Select a file from Google Drive...":
-                    chosen_meta = next(f for f in filtered_files if f["display_name"] == chosen_display)
-                    file_id = f"gd_{chosen_meta['id']}"
-                    file_name_src = chosen_meta["name"]
-                    mime_type = chosen_meta["mimeType"]
+                # Subfolder Navigation Selector
+                if subfolders:
+                    folder_names = ["Select Subfolder to Open..."] + [sf["name"] for sf in subfolders]
+                    chosen_sub = st.selectbox(
+                        "📁 Open Subfolder:",
+                        folder_names,
+                        key=f"sub_sel_{current_folder['id']}_{key_suffix}"
+                    )
+                    if chosen_sub != "Select Subfolder to Open...":
+                        target_sf = next(sf for sf in subfolders if sf["name"] == chosen_sub)
+                        st.session_state.drive_folder_stack.append({"id": target_sf["id"], "name": target_sf["name"]})
+                        st.rerun()
 
-                    if st.session_state.last_scanned_file_id != file_id:
-                        with st.spinner(f"Downloading '{file_name_src}' from Google Drive..."):
-                            file_bytes = download_drive_file_bytes(chosen_meta["id"])
-                    elif st.session_state.scanned_file_payload is not None:
-                        file_bytes = st.session_state.scanned_file_payload["bytes"]
+                # File Selector inside the active folder/subfolder
+                if not drive_files:
+                    st.caption("No PDF or Image files directly inside this folder. Open a subfolder above if files are inside.")
+                else:
+                    file_options = ["Select an Invoice File..."] + [f["name"] for f in drive_files]
+                    chosen_name = st.selectbox(
+                        "📄 Select Invoice File:",
+                        file_options,
+                        key=f"gd_file_sel_{current_folder['id']}_{key_suffix}"
+                    )
+
+                    if chosen_name != "Select an Invoice File...":
+                        chosen_meta = next(f for f in drive_files if f["name"] == chosen_name)
+                        file_id = f"gd_{chosen_meta['id']}"
+                        file_name_src = chosen_meta["name"]
+                        mime_type = chosen_meta["mimeType"]
+
+                        if st.session_state.last_scanned_file_id != file_id:
+                            with st.spinner(f"Downloading '{file_name_src}' from Google Drive..."):
+                                file_bytes = download_drive_file_bytes(chosen_meta["id"])
+                        elif st.session_state.scanned_file_payload is not None:
+                            file_bytes = st.session_state.scanned_file_payload["bytes"]
 
         # Run Local OCR once per newly selected/uploaded file
         if file_bytes is not None and file_id is not None:
