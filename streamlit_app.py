@@ -3,6 +3,8 @@ from datetime import datetime, date
 import io
 import re
 import fitz  # PyMuPDF
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
@@ -18,12 +20,18 @@ st.set_page_config(page_title="Purchased Invoice Entry", page_icon="🧾", layou
 
 st.title("🧾 Purchased Invoice Entry System")
 
-# Google Apps Script Web App Endpoint & Sheet ID
+# Google Apps Script Web App Endpoint, Sheet ID & Shared Drive Folder ID
 WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyOhnkbEa7JHQk49LAH1xg4PXMzeMVwPDfesMbOxeOvsDjcOjL7dEXYBGRymn-Sx6MKkQ/exec"
 SPREADSHEET_ID = "1PCJ3BWAj6Wz1N-55XpuWltvfvYd7KD1q194D3N7MzIg"
 WORKSHEET_NAME = "Purchase_Invoice_Log"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Paste the Folder ID from your other Gmail account (shared with your service account email)
+SHARED_DRIVE_FOLDER_ID = "PASTE_YOUR_SHARED_FOLDER_ID_HERE"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 COMPANY_LIST = [
     "Select Company",
@@ -39,21 +47,34 @@ COMPANY_LIST = [
     "Others"
 ]
 
+PRODUCT_CATEGORY_OPTIONS = [
+    "Select Category",
+    "Paper",
+    "Board / Duplex",
+    "Adhesive / Gum",
+    "Ink / Chemical",
+    "Packaging / Carton",
+    "Printing Plate / Consumables",
+    "Others"
+]
+
 UNIT_OPTIONS = ["per kg", "per pcs", "per gross", "per ream", "per box", "per pkt", "per roll", "Others"]
 GST_PERCENTAGE_OPTIONS = [0.0, 5.0, 12.0, 18.0, 28.0]
 
 # ======================================================
-# Database Connector & History Cache
+# Google Sheets & Shared Google Drive Connectors
 # ======================================================
 @st.cache_resource(ttl=3600)
-def connect_purchase_log_sheet():
+def get_google_clients():
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"], scopes=SCOPES
     )
-    client = gspread.authorize(creds)
-    return client.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
+    gs_client = gspread.authorize(creds)
+    sheet = gs_client.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
+    drive_service = build("drive", "v3", credentials=creds)
+    return sheet, drive_service
 
-purchase_sheet = connect_purchase_log_sheet()
+purchase_sheet, drive_service = get_google_clients()
 
 @st.cache_data(ttl=15)
 def load_history_df():
@@ -62,18 +83,48 @@ def load_history_df():
         return pd.DataFrame(raw_data[1:], columns=raw_data[0])
     return pd.DataFrame()
 
+@st.cache_data(ttl=30)
+def list_shared_drive_files(folder_id):
+    """Lists PDF and Image files inside the shared Google Drive folder."""
+    if not folder_id or folder_id == "PASTE_YOUR_SHARED_FOLDER_ID_HERE":
+        return []
+    try:
+        query = (
+            f"'{folder_id}' in parents and trashed = false and "
+            "(mimeType='application/pdf' or mimeType contains 'image/')"
+        )
+        results = drive_service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, webViewLink, createdTime)",
+            orderBy="createdTime desc",
+            pageSize=50,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        return results.get("files", [])
+    except Exception as e:
+        st.error(f"Could not read shared Google Drive folder: {e}")
+        return []
+
+def download_drive_file_bytes(file_id):
+    """Downloads file bytes from Google Drive for OCR scanning & archiving."""
+    request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
 # ======================================================
 # Free Local OCR Extractor (Tesseract + PyMuPDF)
 # ======================================================
 def preprocess_and_ocr_image(pil_img):
-    """Converts image to high-contrast grayscale and extracts text via Tesseract."""
     gray = ImageOps.grayscale(pil_img)
     gray = ImageOps.autocontrast(gray)
     return pytesseract.image_to_string(gray, config="--oem 3 --psm 6")
 
-
 def extract_text_from_scan(file_bytes, mime_type):
-    """Extracts text from PDF (digital or scanned) or Image using free local libraries."""
     if "pdf" in mime_type.lower():
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         full_text = ""
@@ -82,7 +133,6 @@ def extract_text_from_scan(file_bytes, mime_type):
             if len(page_text) > 30:
                 full_text += page_text + "\n"
             else:
-                # Scanned PDF page: render at 250 DPI and run Tesseract OCR
                 pix = page.get_pixmap(dpi=250)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
                 full_text += preprocess_and_ocr_image(img) + "\n"
@@ -91,9 +141,7 @@ def extract_text_from_scan(file_bytes, mime_type):
         img = Image.open(io.BytesIO(file_bytes))
         return preprocess_and_ocr_image(img).strip()
 
-
 def parse_indian_invoice_text(raw_text):
-    """Parses extracted OCR text into structured invoice fields."""
     if not raw_text or len(raw_text.strip()) < 10:
         return None, "Could not detect readable text on the scan."
 
@@ -112,14 +160,12 @@ def parse_indian_invoice_text(raw_text):
 
     text_upper = raw_text.upper()
 
-    # 1. Match Company Name from COMPANY_LIST
     for comp in COMPANY_LIST[1:-1]:
         clean_tokens = [t for t in re.split(r"[^A-Z0-9]+", comp.upper()) if len(t) > 2 and t not in ["PVT", "LTD", "COMPANY", "CORPORATION"]]
         if clean_tokens and all(tok in text_upper for tok in clean_tokens[:2]):
             extracted["company_name"] = comp
             break
 
-    # 2. Extract Invoice Date (DD/MM/YYYY or DD-MM-YYYY)
     date_match = re.search(
         r"(?:DATE|DATED|INV\.?\s*DATE)[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
         raw_text,
@@ -135,7 +181,6 @@ def parse_indian_invoice_text(raw_text):
                 parts[2] = "20" + parts[2]
             extracted["invoice_date"] = f"{parts[0].zfill(2)}/{parts[1].zfill(2)}/{parts[2]}"
 
-    # 3. Extract Invoice Number
     inv_match = re.search(
         r"(?:INVOICE\s*NO|INV\.?\s*NO|BILL\s*NO|CHALLAN\s*NO)[\s.:\-#]*([A-Z0-9\/\-]{2,25})",
         raw_text,
@@ -146,12 +191,10 @@ def parse_indian_invoice_text(raw_text):
         if candidate.upper() not in ["DATE", "DATED", "TO", "GSTIN"]:
             extracted["invoice_number"] = candidate
 
-    # 4. Extract HSN Code (4 to 8 digits near HSN label)
     hsn_match = re.search(r"(?:HSN(?:\/SAC)?|SAC)[\s.:\-]*(\d{4,8})\b", raw_text, re.IGNORECASE)
     if hsn_match:
         extracted["hsn"] = hsn_match.group(1)
 
-    # 5. Extract GST Percentage (checks CGST/SGST split or IGST/GST total)
     split_gst = re.search(r"(?:CGST|SGST)[\s@:\-]*(\d{1,2}(?:\.\d+)?)\s*%", raw_text, re.IGNORECASE)
     full_gst = re.search(r"(?:IGST|GST)[\s@:\-]*(\d{1,2}(?:\.\d+)?)\s*%", raw_text, re.IGNORECASE)
     if split_gst:
@@ -163,7 +206,6 @@ def parse_indian_invoice_text(raw_text):
         if val in GST_PERCENTAGE_OPTIONS:
             extracted["gst_percentage"] = val
 
-    # 6. Detect Unit keywords
     unit_map = {
         "per kg": r"\b(?:KGS?|KILOGRAMS?)\b",
         "per pcs": r"\b(?:PCS|PIECES?|NOS)\b",
@@ -178,7 +220,6 @@ def parse_indian_invoice_text(raw_text):
             extracted["unit"] = u_label
             break
 
-    # 7. Extract Quantity & Rate (looks for line items with Qty + Unit + Rate pattern)
     qty_rate_match = re.search(
         r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:KGS?|PCS|NOS|REAMS?|GROSS|BOX|PKT|ROLL)?\s*[@xX×]?\s*(\d+(?:,\d{3})*(?:\.\d{1,2}))",
         raw_text,
@@ -194,7 +235,6 @@ def parse_indian_invoice_text(raw_text):
         except ValueError:
             pass
 
-    # 8. Extract Round Off if present
     ro_match = re.search(r"ROUND\s*OFF[\s:\-]*([+-]?\s*\d+(?:\.\d{1,2})?)", raw_text, re.IGNORECASE)
     if ro_match:
         try:
@@ -213,7 +253,6 @@ def parse_indian_invoice_text(raw_text):
 
     return extracted, None
 
-
 def run_local_invoice_ocr(file_bytes, mime_type):
     try:
         raw_text = extract_text_from_scan(file_bytes, mime_type)
@@ -223,7 +262,6 @@ def run_local_invoice_ocr(file_bytes, mime_type):
         return None, "", "Tesseract OCR engine not installed (add 'tesseract-ocr' to packages.txt and reboot)."
     except Exception as e:
         return None, "", f"OCR error: {e}"
-
 
 def match_company_dropdown(extracted_name):
     if not extracted_name:
@@ -302,7 +340,6 @@ def upload_scan_to_drive_via_appscript(file_bytes, file_name, mime_type, company
         st.error(f"Failed to connect to Apps Script: {e}")
     return None
 
-
 def execute_final_save(entry_data, scan_obj):
     with st.spinner("Uploading Scan to Google Drive & Saving Entry..."):
         clean_inv = entry_data["inv_number"].replace("/", "_")
@@ -324,6 +361,7 @@ def execute_final_save(entry_data, scan_obj):
                 entry_data["company_name"],
                 entry_data["inv_number"],
                 entry_data["product_name"],
+                entry_data["product_category"],
                 entry_data["hsn"],
                 entry_data["quantity"],
                 entry_data["rate"],
@@ -368,36 +406,78 @@ key_suffix = st.session_state.form_key
 tab1, tab2 = st.tabs(["➕ New Purchase Entry", "📋 Purchase History Log"])
 
 # ------------------------------------------------------
-# TAB 1: FREE LOCAL OCR AUTO-FILL + HSN VERIFICATION
+# TAB 1: SCAN / CAPTURE / SHARED GDRIVE + ENTRY FORM
 # ------------------------------------------------------
 with tab1:
-    st.subheader("1️⃣ Upload or Capture Invoice Scan (Free Local OCR)")
+    st.subheader("1️⃣ Attach Invoice Scan (Device Upload, Camera, or Shared Drive)")
 
     with st.container(border=True):
         scan_source = st.radio(
             "Select Scan Source",
-            ["📁 Upload File from Device", "📷 Camera Capture"],
+            ["📁 Upload File from Device", "📷 Camera Capture", "☁️ Pick from Google Drive Folder"],
             horizontal=True,
             key=f"scan_src_{key_suffix}"
         )
 
+        file_bytes = None
+        file_id = None
+        file_name_src = "scan.png"
+        mime_type = "image/png"
+
         if scan_source == "📷 Camera Capture":
             uploaded_scan = st.camera_input("Capture Invoice Image", key=f"cam_{key_suffix}")
-        else:
+            if uploaded_scan is not None:
+                file_bytes = uploaded_scan.getvalue()
+                file_name_src = "camera_capture.png"
+                mime_type = getattr(uploaded_scan, "type", "image/png") or "image/png"
+                file_id = f"cam_{len(file_bytes)}"
+
+        elif scan_source == "📁 Upload File from Device":
             uploaded_scan = st.file_uploader(
                 "Upload Invoice Scan (PNG, JPG, PDF) — Computer will read text & fill fields below",
                 type=["png", "jpg", "jpeg", "pdf"],
                 key=f"upl_{key_suffix}"
             )
+            if uploaded_scan is not None:
+                file_bytes = uploaded_scan.getvalue()
+                file_name_src = uploaded_scan.name
+                mime_type = getattr(uploaded_scan, "type", "image/png") or "image/png"
+                file_id = f"upl_{file_name_src}_{len(file_bytes)}"
 
-        if uploaded_scan is not None:
-            file_bytes = uploaded_scan.getvalue()
-            file_id = f"{getattr(uploaded_scan, 'name', 'cam')}_{len(file_bytes)}"
-            mime_type = getattr(uploaded_scan, "type", "image/png") or "image/png"
+        else:
+            col_gd1, col_gd2 = st.columns([4, 1])
+            with col_gd2:
+                if st.button("🔄 Refresh Folder", use_container_width=True):
+                    list_shared_drive_files.clear()
+                    st.rerun()
 
+            drive_files = list_shared_drive_files(SHARED_DRIVE_FOLDER_ID)
+            with col_gd1:
+                if SHARED_DRIVE_FOLDER_ID == "PASTE_YOUR_SHARED_FOLDER_ID_HERE":
+                    st.info("Set `SHARED_DRIVE_FOLDER_ID` in `app.py` and share that folder with your Service Account email.")
+                elif not drive_files:
+                    st.warning("No PDF or Image files found in the shared Google Drive folder.")
+                else:
+                    file_options = ["Select a file from Google Drive..."] + [f["name"] for f in drive_files]
+                    chosen_name = st.selectbox("Choose Invoice File from Shared Folder:", file_options, key=f"gd_sel_{key_suffix}")
+
+                    if chosen_name != "Select a file from Google Drive...":
+                        chosen_meta = next(f for f in drive_files if f["name"] == chosen_name)
+                        file_id = f"gd_{chosen_meta['id']}"
+                        file_name_src = chosen_meta["name"]
+                        mime_type = chosen_meta["mimeType"]
+
+                        if st.session_state.last_scanned_file_id != file_id:
+                            with st.spinner(f"Downloading '{file_name_src}' from Google Drive..."):
+                                file_bytes = download_drive_file_bytes(chosen_meta["id"])
+                        elif st.session_state.scanned_file_payload is not None:
+                            file_bytes = st.session_state.scanned_file_payload["bytes"]
+
+        # Run Local OCR once per newly selected/uploaded file
+        if file_bytes is not None and file_id is not None:
             st.session_state.scanned_file_payload = {
                 "bytes": file_bytes,
-                "name": getattr(uploaded_scan, "name", "camera_capture.png"),
+                "name": file_name_src,
                 "mime": mime_type
             }
 
@@ -408,20 +488,17 @@ with tab1:
                     st.session_state.raw_ocr_text = raw_text
 
                     if extracted:
-                        # 1. Date
                         try:
                             parsed_dt = datetime.strptime(extracted.get("invoice_date", ""), "%d/%m/%Y").date()
                             st.session_state[f"inv_date_{key_suffix}"] = parsed_dt
                         except ValueError:
                             pass
 
-                        # 2. Company
                         dd_comp, manual_comp = match_company_dropdown(extracted.get("company_name", ""))
                         st.session_state[f"comp_{key_suffix}"] = dd_comp
                         if dd_comp == "Others":
                             st.session_state[f"manual_comp_{key_suffix}"] = manual_comp
 
-                        # 3. Text, HSN & Unit
                         if extracted.get("invoice_number"):
                             st.session_state[f"inv_num_{key_suffix}"] = str(extracted["invoice_number"])
                         if extracted.get("hsn"):
@@ -431,7 +508,6 @@ with tab1:
                         if ext_unit in UNIT_OPTIONS:
                             st.session_state[f"unit_{key_suffix}"] = ext_unit
 
-                        # 4. Numbers & GST
                         if extracted.get("quantity", 0.0) > 0:
                             st.session_state[f"qty_{key_suffix}"] = float(extracted["quantity"])
                         if extracted.get("rate", 0.0) > 0:
@@ -465,6 +541,13 @@ with tab1:
 
         inv_number = st.text_input("Invoice Number *", placeholder="e.g. INV/2026/001", key=f"inv_num_{key_suffix}")
         product_name = st.text_input("Product Name *", placeholder="e.g. Maplitho Paper", key=f"prod_name_{key_suffix}")
+
+        selected_category = st.selectbox("Product Category *", PRODUCT_CATEGORY_OPTIONS, key=f"prod_cat_{key_suffix}")
+        if selected_category == "Others":
+            final_category = st.text_input("Enter Custom Product Category *", placeholder="e.g. Lamination Film", key=f"manual_cat_{key_suffix}")
+        else:
+            final_category = selected_category
+
         hsn_code = st.text_input("HSN Code *", placeholder="e.g. 4802", key=f"hsn_{key_suffix}")
 
         selected_unit = st.selectbox("Unit *", UNIT_OPTIONS, key=f"unit_{key_suffix}")
@@ -477,7 +560,6 @@ with tab1:
         quantity = st.number_input("Quantity *", min_value=0.0, step=1.0, format="%.2f", key=f"qty_{key_suffix}")
         rate = st.number_input("Rate *", min_value=0.0, step=0.5, format="%.2f", key=f"rate_{key_suffix}")
         
-        # 1. Automatic Taxable Value calculation (Quantity * Rate)
         taxable_value = round(quantity * rate, 2)
         st.number_input(
             "Taxable Value (₹) [Qty × Rate]",
@@ -487,7 +569,6 @@ with tab1:
             key=f"tax_val_{key_suffix}_{taxable_value}"
         )
 
-        # 2. GST Percentage Selection & Live Calculation
         gst_pct = st.selectbox("GST Percentage (%) *", GST_PERCENTAGE_OPTIONS, index=1, key=f"gst_pct_{key_suffix}")
         
         half_gst_pct = gst_pct / 2.0
@@ -500,10 +581,8 @@ with tab1:
         c_m2.metric(f"CGST ({half_gst_pct}%)", f"₹ {cgst_val:,.2f}")
         c_m3.metric(f"Total GST ({gst_pct}%)", f"₹ {total_gst:,.2f}")
 
-        # 3. Round Off Adjustment
         round_off = st.number_input("Round Off (+/-)", step=0.01, format="%.2f", key=f"round_{key_suffix}")
         
-        # 4. Final Invoice Value Calculation
         calc_inv_val = round(taxable_value + total_gst + round_off, 2)
         inv_val_key = f"inv_val_{key_suffix}"
         last_calc_key = f"last_calc_{key_suffix}"
@@ -522,16 +601,17 @@ with tab1:
 
     remark = st.text_area("Remark / Notes", placeholder="Supplier details, batch numbers, or terms...", key=f"rem_{key_suffix}")
 
-    # Submission + HSN Verification Check
     if st.button("✅ Save Purchase Entry & Upload Scan", type="primary", use_container_width=True):
         if st.session_state.scanned_file_payload is None:
-            st.warning("⚠️ Please upload or capture the invoice scan copy at the top first.")
+            st.warning("⚠️ Please attach an invoice scan (Upload, Camera, or Google Drive) at the top first.")
         elif selected_company == "Select Company" or not company_name.strip():
             st.warning("⚠️ Please select or enter a valid Company Name.")
         elif not inv_number.strip():
             st.warning("⚠️ Please enter an Invoice Number.")
         elif not product_name.strip():
             st.warning("⚠️ Please enter a Product Name.")
+        elif selected_category == "Select Category" or not final_category.strip():
+            st.warning("⚠️ Please select or enter a Product Category.")
         elif not hsn_code.strip():
             st.warning("⚠️ Please enter an HSN Code.")
         elif selected_unit == "Others" and not final_unit.strip():
@@ -546,6 +626,7 @@ with tab1:
                 "company_name": company_name.strip(),
                 "inv_number": inv_number.strip(),
                 "product_name": product_name.strip(),
+                "product_category": final_category.strip(),
                 "hsn": hsn_code.strip(),
                 "quantity": quantity,
                 "rate": rate,
@@ -575,9 +656,6 @@ with tab1:
             else:
                 execute_final_save(entry_payload, st.session_state.scanned_file_payload)
 
-    # --------------------------------------------------
-    # HSN MISMATCH CONFIRMATION HOLD BANNER
-    # --------------------------------------------------
     if st.session_state.hsn_hold_state is not None:
         hold_info = st.session_state.hsn_hold_state
         with st.container(border=True):
