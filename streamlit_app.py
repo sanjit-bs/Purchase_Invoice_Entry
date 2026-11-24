@@ -89,7 +89,6 @@ def list_drive_folder_contents(folder_id):
     if not folder_id or folder_id == "PASTE_YOUR_SHARED_FOLDER_ID_HERE":
         return [], []
     try:
-        # 1. Fetch Subfolders
         folder_query = (
             f"'{folder_id}' in parents and trashed = false and "
             "mimeType = 'application/vnd.google-apps.folder'"
@@ -104,7 +103,6 @@ def list_drive_folder_contents(folder_id):
         ).execute()
         subfolders = folder_res.get("files", [])
 
-        # 2. Fetch PDF & Image Files
         file_query = (
             f"'{folder_id}' in parents and trashed = false and "
             "(mimeType='application/pdf' or mimeType contains 'image/')"
@@ -396,6 +394,7 @@ def execute_final_save(entry_data, scan_obj):
             st.cache_data.clear()
             st.session_state.scanned_file_payload = None
             st.session_state.last_scanned_file_id = None
+            st.session_state.selected_drive_file = None
             st.session_state.raw_ocr_text = ""
             st.session_state.hsn_hold_state = None
             st.session_state.form_key += 1
@@ -410,6 +409,8 @@ if "last_scanned_file_id" not in st.session_state:
     st.session_state.last_scanned_file_id = None
 if "scanned_file_payload" not in st.session_state:
     st.session_state.scanned_file_payload = None
+if "selected_drive_file" not in st.session_state:
+    st.session_state.selected_drive_file = None
 if "hsn_hold_state" not in st.session_state:
     st.session_state.hsn_hold_state = None
 if "raw_ocr_text" not in st.session_state:
@@ -425,7 +426,7 @@ key_suffix = st.session_state.form_key
 tab1, tab2 = st.tabs(["➕ New Purchase Entry", "📋 Purchase History Log"])
 
 # ------------------------------------------------------
-# TAB 1: SCAN / CAPTURE / SUBFOLDER GDRIVE + ENTRY FORM
+# TAB 1: ONE-CLICK GDRIVE BROWSER / CAPTURE / UPLOAD
 # ------------------------------------------------------
 with tab1:
     st.subheader("1️⃣ Attach Invoice Scan (Device Upload, Camera, or Shared Drive)")
@@ -469,57 +470,66 @@ with tab1:
             else:
                 current_folder = st.session_state.drive_folder_stack[-1]
                 breadcrumb = " / ".join([f["name"] for f in st.session_state.drive_folder_stack])
+                drive_web_url = f"https://drive.google.com/drive/folders/{current_folder['id']}"
 
-                nav_c1, nav_c2, nav_c3 = st.columns([3.5, 1, 1])
+                # Top Action Bar: Breadcrumb + One-Click Open in Google Drive + Back + Refresh
+                nav_c1, nav_c2, nav_c3, nav_c4 = st.columns([3, 1.5, 1, 0.8])
                 with nav_c1:
-                    st.markdown(f"**📂 Current Folder:** `{breadcrumb}`")
+                    st.markdown(f"**📂 Folder:** `{breadcrumb}`")
                 with nav_c2:
+                    st.link_button("↗️ Open in Google Drive", drive_web_url, use_container_width=True)
+                with nav_c3:
                     if len(st.session_state.drive_folder_stack) > 1:
-                        if st.button("⬅️ Back One Folder", use_container_width=True):
+                        if st.button("⬅️ Back", use_container_width=True):
                             st.session_state.drive_folder_stack.pop()
                             st.rerun()
-                with nav_c3:
+                with nav_c4:
                     if st.button("🔄 Refresh", use_container_width=True):
                         list_drive_folder_contents.clear()
                         st.rerun()
 
                 subfolders, drive_files = list_drive_folder_contents(current_folder["id"])
 
-                # Subfolder Navigation Selector
+                # One-Click Subfolder Grid
                 if subfolders:
-                    folder_names = ["Select Subfolder to Open..."] + [sf["name"] for sf in subfolders]
-                    chosen_sub = st.selectbox(
-                        "📁 Open Subfolder:",
-                        folder_names,
-                        key=f"sub_sel_{current_folder['id']}_{key_suffix}"
-                    )
-                    if chosen_sub != "Select Subfolder to Open...":
-                        target_sf = next(sf for sf in subfolders if sf["name"] == chosen_sub)
-                        st.session_state.drive_folder_stack.append({"id": target_sf["id"], "name": target_sf["name"]})
-                        st.rerun()
+                    st.caption("Click a subfolder to open it:")
+                    sf_cols = st.columns(min(4, len(subfolders)))
+                    for idx, sf in enumerate(subfolders):
+                        with sf_cols[idx % 4]:
+                            if st.button(f"📁 {sf['name']}", key=f"sf_btn_{sf['id']}_{key_suffix}", use_container_width=True):
+                                st.session_state.drive_folder_stack.append({"id": sf["id"], "name": sf["name"]})
+                                st.rerun()
 
-                # File Selector inside the active folder/subfolder
+                # One-Click File Selection Grid
                 if not drive_files:
-                    st.caption("No PDF or Image files directly inside this folder. Open a subfolder above if files are inside.")
+                    st.caption("No PDF or Image files directly inside this folder.")
                 else:
-                    file_options = ["Select an Invoice File..."] + [f["name"] for f in drive_files]
-                    chosen_name = st.selectbox(
-                        "📄 Select Invoice File:",
-                        file_options,
-                        key=f"gd_file_sel_{current_folder['id']}_{key_suffix}"
-                    )
+                    st.caption("Click an invoice file below to select & auto-scan:")
+                    f_cols = st.columns(min(3, len(drive_files)))
+                    for idx, df_item in enumerate(drive_files):
+                        is_selected = (
+                            st.session_state.selected_drive_file is not None
+                            and st.session_state.selected_drive_file["id"] == df_item["id"]
+                        )
+                        btn_label = f"✅ {df_item['name']}" if is_selected else f"📄 {df_item['name']}"
+                        btn_type = "primary" if is_selected else "secondary"
+                        with f_cols[idx % 3]:
+                            if st.button(btn_label, key=f"f_btn_{df_item['id']}_{key_suffix}", type=btn_type, use_container_width=True):
+                                st.session_state.selected_drive_file = df_item
+                                st.rerun()
 
-                    if chosen_name != "Select an Invoice File...":
-                        chosen_meta = next(f for f in drive_files if f["name"] == chosen_name)
-                        file_id = f"gd_{chosen_meta['id']}"
-                        file_name_src = chosen_meta["name"]
-                        mime_type = chosen_meta["mimeType"]
+                # Process whichever Drive file was clicked
+                if st.session_state.selected_drive_file is not None:
+                    chosen_meta = st.session_state.selected_drive_file
+                    file_id = f"gd_{chosen_meta['id']}"
+                    file_name_src = chosen_meta["name"]
+                    mime_type = chosen_meta["mimeType"]
 
-                        if st.session_state.last_scanned_file_id != file_id:
-                            with st.spinner(f"Downloading '{file_name_src}' from Google Drive..."):
-                                file_bytes = download_drive_file_bytes(chosen_meta["id"])
-                        elif st.session_state.scanned_file_payload is not None:
-                            file_bytes = st.session_state.scanned_file_payload["bytes"]
+                    if st.session_state.last_scanned_file_id != file_id:
+                        with st.spinner(f"Downloading '{file_name_src}' from Google Drive..."):
+                            file_bytes = download_drive_file_bytes(chosen_meta["id"])
+                    elif st.session_state.scanned_file_payload is not None:
+                        file_bytes = st.session_state.scanned_file_payload["bytes"]
 
         # Run Local OCR once per newly selected/uploaded file
         if file_bytes is not None and file_id is not None:
@@ -567,9 +577,9 @@ with tab1:
                         if ext_gst in GST_PERCENTAGE_OPTIONS:
                             st.session_state[f"gst_pct_{key_suffix}"] = ext_gst
 
-                        st.success("✅ Scan read locally! Please review and complete any remaining fields below.")
+                        st.success(f"✅ Selected & scanned `{file_name_src}`! Please review fields below.")
                     else:
-                        st.warning(f"⚠️ Could not auto-fill from scan ({err_msg}) **Please enter the details manually below.**")
+                        st.warning(f"⚠️ Attached `{file_name_src}`, but could not auto-fill ({err_msg}) **Please enter details manually below.**")
 
         if st.session_state.raw_ocr_text:
             with st.expander("📄 View Raw Scanned Text (For Quick Copy/Reference)"):
